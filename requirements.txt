@@ -1,0 +1,7 @@
+streamlit
+pandas
+matplotlib
+seaborn
+plotly
+mip>=1.15.0.post1
+openpyxl
