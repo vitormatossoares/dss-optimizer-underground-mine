@@ -5,10 +5,17 @@ Orquestração: Greedy -> Evaluate -> (opcional) SA -> (opcional) MC.
 
 - run_greedy_eval: roda apenas Greedy e avalia.
 - run_greedy_sa_eval: usa Greedy como warm-start, roda SA e avalia melhor solução.
+
+Principais pontos:
+- MC roda sobre o "alloc" AVALIADO (contém T_ef_min, cycle_min, n_trips etc.).
+- Export "por caminhão" é robusto a colunas ausentes (DF/UF/cap_ton).
 """
 
 from __future__ import annotations
 from typing import Dict, Any, Optional, List
+from pathlib import Path
+from datetime import datetime
+import numpy as np
 import pandas as pd
 
 from .greedy import greedy_allocation
@@ -17,18 +24,96 @@ from .sa import run_sa, SAParams
 from .mc import run_monte_carlo as run_mc
 
 
+# --------------------------------------------------------------------- #
+# CSV "por caminhão" (OD | CAMINHÃO | Ciclo | Viagens | Produtividade | DF | UF | T_ef_min | Cap_ton | Produção total)
+# --------------------------------------------------------------------- #
+def _make_eqp_csv(eval_pkg: dict, df_frota: pd.DataFrame) -> pd.DataFrame:
+    cols_out = [
+        "OD", "CAMINHÃO", "Tempo Médio do Ciclo", "Número de Viagens",
+        "Produtividade (t/h)", "DF", "UF", "T_ef_min", "Cap_ton", "Produção total"
+    ]
+    alloc = (eval_pkg or {}).get("alloc", pd.DataFrame())
+    if alloc is None or alloc.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    alloc = alloc.copy()
+
+    # Garante colunas mínimas no alloc
+    for c in ("od_id", "eqp_id", "cycle_min", "n_trips", "T_ef_min", "ton_estimado"):
+        if c not in alloc.columns:
+            alloc[c] = np.nan
+
+    # Frota: garante DF/UF (default 1.0) e tenta obter cap_ton
+    f = df_frota.copy()
+    if "df_pct" not in f.columns:
+        f["df_pct"] = 1.0
+    if "uf_pct" not in f.columns:
+        f["uf_pct"] = 1.0
+    if "cap_ton" not in f.columns:
+        f["cap_ton"] = np.nan
+
+    base = f[["eqp_id", "df_pct", "uf_pct", "cap_ton"]].drop_duplicates("eqp_id")
+    alloc = alloc.merge(base, on="eqp_id", how="left")
+
+    # Se cap_ton faltar, deriva de ton_estimado / n_trips (quando possível)
+    if "cap_ton" not in alloc.columns or alloc["cap_ton"].isna().all():
+        alloc["cap_ton"] = np.where(
+            pd.to_numeric(alloc["n_trips"], errors="coerce").fillna(0) > 0,
+            pd.to_numeric(alloc["ton_estimado"], errors="coerce") / pd.to_numeric(alloc["n_trips"], errors="coerce"),
+            np.nan
+        )
+
+    # Defaults DF/UF
+    alloc["df_pct"] = pd.to_numeric(alloc.get("df_pct", 1.0), errors="coerce").fillna(1.0)
+    alloc["uf_pct"] = pd.to_numeric(alloc.get("uf_pct", 1.0), errors="coerce").fillna(1.0)
+
+    # Produtividade (t/h) pela base da FO (usa T_ef_min)
+    alloc["Produtividade (t/h)"] = np.where(
+        pd.to_numeric(alloc["T_ef_min"], errors="coerce") > 0,
+        pd.to_numeric(alloc["ton_estimado"], errors="coerce") / (pd.to_numeric(alloc["T_ef_min"], errors="coerce") / 60.0),
+        np.nan
+    )
+
+    out = alloc.rename(columns={
+        "od_id": "OD",
+        "eqp_id": "CAMINHÃO",
+        "cycle_min": "Tempo Médio do Ciclo",
+        "n_trips": "Número de Viagens",
+        "df_pct": "DF",
+        "uf_pct": "UF",
+        "cap_ton": "Cap_ton",
+        "ton_estimado": "Produção total",
+        "T_ef_min": "T_ef_min",
+    })
+
+    for c in cols_out:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    return out[cols_out]
+
+
+def _save_eqp_csv(eval_pkg: dict, df_frota: pd.DataFrame, outdir: str = "data/out") -> Optional[str]:
+    df = _make_eqp_csv(eval_pkg, df_frota)
+    if df is None or df.empty:
+        return None
+    Path(outdir).mkdir(parents=True, exist_ok=True)
+    path = Path(outdir) / f"alloc_por_caminhao_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    df.to_csv(path, index=False, encoding="utf-8")
+    return str(path)
+
+
+# --------------------------------------------------------------------- #
 def _normalize_inputs_minmax(df_inputs: pd.DataFrame, default_min: int = 1) -> pd.DataFrame:
     """Garante colunas eqp_min/eqp_max coerentes; força eqp_min >= default_min (tipicamente 1)."""
     df = df_inputs.copy()
 
-    # eqp_min: se ausente/nulo/<=0 vira default_min
     if "eqp_min" not in df.columns:
         df["eqp_min"] = default_min
     else:
         df["eqp_min"] = pd.to_numeric(df["eqp_min"], errors="coerce").fillna(default_min).astype(int)
         df.loc[df["eqp_min"] < default_min, "eqp_min"] = default_min
 
-    # eqp_max: se ausente vira teto alto
     if "eqp_max" not in df.columns:
         df["eqp_max"] = 10**9
     else:
@@ -37,6 +122,7 @@ def _normalize_inputs_minmax(df_inputs: pd.DataFrame, default_min: int = 1) -> p
     return df
 
 
+# --------------------------------------------------------------------- #
 def run_greedy_eval(
     df_frota: pd.DataFrame,
     df_ciclo: pd.DataFrame,
@@ -50,7 +136,9 @@ def run_greedy_eval(
     overshoot_penalty_ton: float = 0.0,  # λ: penalidade por excesso (t)
     # ---- demais flags ----
     ignore_outliers_flag: bool = True,
-    N_MC: int = 0,  # se > 0 roda MC
+    N_MC: int = 0,               # se > 0 roda MC
+    save_eqp_csv: bool = True,   # salva CSV por caminhão
+    outdir: str = "data/out",
 ) -> Dict[str, Any]:
     # 1) Frota do dia
     df_frota_today = (
@@ -94,23 +182,32 @@ def run_greedy_eval(
         ),
     )
 
-    # 6) Monte Carlo (se solicitado)
+    # 5b) CSV por caminhão (opcional + protegido)
+    eqp_csv_path = None
+    if save_eqp_csv:
+        try:
+            eqp_csv_path = _save_eqp_csv(eval_pkg, df_frota_today, outdir=outdir)
+        except Exception as e:
+            print(f"[WARN] Falha ao salvar CSV por caminhão: {e}")
+            eqp_csv_path = None
+
+    # 6) Monte Carlo (se solicitado) — usa o alloc AVALIADO
     mc_pkg = None
     if N_MC and N_MC > 0:
         mc_pkg = run_mc(
-            aloc_df=df_alloc,
+            aloc_df=eval_pkg["alloc"],
             df_ciclo=df_ciclo,
             df_inputs=df_inputs_norm,
             T_op_min=int(T_op_min),
             N_MC=int(N_MC),
             ignore_outliers_flag=bool(ignore_outliers_flag),
-            # cycle_dist / phys_bounds / etc podem ser expostos depois
         )
 
     return {
         "alloc_greedy": df_alloc,
         "greedy_eval": eval_pkg,
         "mc": mc_pkg,
+        "eqp_csv_path": eqp_csv_path,
         "run_params": {
             "T_op_min": int(T_op_min),
             "N_MC": int(N_MC),
@@ -118,10 +215,13 @@ def run_greedy_eval(
             "underutil_penalty": float(underutil_penalty),
             "overshoot_penalty_ton": float(overshoot_penalty_ton),
             "ignore_outliers_flag": bool(ignore_outliers_flag),
+            "save_eqp_csv": bool(save_eqp_csv),
+            "outdir": outdir,
         },
     }
 
 
+# --------------------------------------------------------------------- #
 def run_greedy_sa_eval(
     df_frota: pd.DataFrame,
     df_ciclo: pd.DataFrame,
@@ -136,7 +236,9 @@ def run_greedy_sa_eval(
     # ---- demais flags ----
     ignore_outliers_flag: bool = True,
     sa_params: Optional[SAParams] = None,
-    N_MC: int = 0,  # se > 0 roda MC
+    N_MC: int = 0,               # se > 0 roda MC
+    save_eqp_csv: bool = True,   # salva CSV por caminhão da solução final
+    outdir: str = "data/out",
 ) -> Dict[str, Any]:
     """
     Greedy (warm-start) -> SA -> Evaluate melhor solução -> (opcional) MC.
@@ -185,11 +287,24 @@ def run_greedy_sa_eval(
         params=sa_params,
     )
 
-    # MC (sobre a melhor solução do SA)
+    # Avaliação da melhor solução do SA
+    best_eval = sa_result["best_eval"]  # já contém by_od/alloc/objetivo/etc
+
+    # CSV por caminhão da solução final (opcional + protegido)
+    eqp_csv_path = None
+    if save_eqp_csv:
+        try:
+            eqp_csv_path = _save_eqp_csv(best_eval, df_frota_today, outdir=outdir)
+        except Exception as e:
+            print(f"[WARN] Falha ao salvar CSV por caminhão: {e}")
+            eqp_csv_path = None
+
+    # MC (sobre a melhor solução do SA) — usa alloc avaliado
     mc_pkg = None
     if N_MC and N_MC > 0:
+        aloc_for_mc = best_eval.get("alloc", sa_result.get("best_alloc"))
         mc_pkg = run_mc(
-            aloc_df=sa_result["best_alloc"],
+            aloc_df=aloc_for_mc,
             df_ciclo=df_ciclo,
             df_inputs=df_inputs_norm,
             T_op_min=int(T_op_min),
@@ -200,9 +315,10 @@ def run_greedy_sa_eval(
     return {
         "alloc_greedy": start_alloc,
         "sa_best_alloc": sa_result["best_alloc"],
-        "sa_best_eval": sa_result["best_eval"],
+        "sa_best_eval": best_eval,
         "sa_history": sa_result["history"],
         "mc": mc_pkg,
+        "eqp_csv_path": eqp_csv_path,
         "run_params": {
             "T_op_min": int(T_op_min),
             "beta_softcap": float(beta_softcap),
@@ -211,5 +327,10 @@ def run_greedy_sa_eval(
             "ignore_outliers_flag": bool(ignore_outliers_flag),
             "sa": sa_params.__dict__,
             "N_MC": int(N_MC),
+            "save_eqp_csv": bool(save_eqp_csv),
+            "outdir": outdir,
         },
     }
+
+
+__all__ = ["run_greedy_eval", "run_greedy_sa_eval"]

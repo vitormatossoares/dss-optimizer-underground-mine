@@ -1,0 +1,3 @@
+﻿Frente (OD),Produção (t),Viagens,Caminhões,Meta (t),Prioridade,Excesso (t),Tempo p/ bater meta (h),Viável no turno?,Status
+22 SER - 11 GRADE,300.0,12,3,400.0,1.0,0.0,16.0,False,❌ Não bate
+23 FGS - 11 GRADE,190.0,5,2,380.0,1.0,0.0,23.999999999999996,False,❌ Não bate

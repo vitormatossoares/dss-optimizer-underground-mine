@@ -7,10 +7,11 @@ Compatível com a UI:
 - Retorna producao_df, frac_df, viagens_df, tempo_df
 - Se return_samples=True, retorna samples_ton, samples_frac, samples_viagens, samples_tempo (usados no violino)
 
-Cálculo:
+Cálculo (alinhado ao Evaluate):
 - Nº de viagens usa T_ef_min por eqp (ou T_op_min como fallback)
-- Throughput amostrado = soma(cap_ton / ciclo) [t/min]
-- Tempo para meta = meta [t] / throughput [t/min]  => minutos (e horas)
+- Produção no turno = soma(n_viagens_k * cap_k)
+- Taxa por hora de relógio em cada iteração: rate_elapsed_tph_i = ton_total / (T_op_min/60)
+- Tempo para meta (min): tmeta_min_i = (meta / rate_elapsed_tph_i) * 60
 """
 
 from __future__ import annotations
@@ -193,6 +194,8 @@ def run_monte_carlo(
         samples_ton_all, samples_frac_all = [], []
         samples_viag_all, samples_tempo_all = [], []
 
+    EPS = 1e-9
+
     for od_id, grupo_od in aloc_df.groupby("od_id"):
         meta_arr = df_inputs.loc[df_inputs["od_id"] == od_id, "mass_target_ton"].values
         meta = float(meta_arr[0]) if meta_arr.size > 0 else 0.0
@@ -203,12 +206,11 @@ def run_monte_carlo(
         prod = np.empty(N_MC, dtype=float)
         frac = np.empty(N_MC, dtype=float)
         viag = np.empty(N_MC, dtype=float)
-        tmeta = np.empty(N_MC, dtype=float)  # minutos
+        tmeta_min = np.empty(N_MC, dtype=float)  # minutos (elapsed)
 
         for i in range(N_MC):
             total_ton = 0.0
             total_viagens = 0
-            tpm_i = 0.0  # t/min
 
             for eqp_id in eqps_od:
                 cap = float(cap_map.get(eqp_id, np.nan))
@@ -234,17 +236,18 @@ def run_monte_carlo(
                     total_viagens += n_ciclos
                     total_ton += n_ciclos * cap
 
-                tpm_i += cap / ciclo
-
             prod[i] = total_ton
             frac[i] = (total_ton / meta) if meta > 0 else 0.0
             viag[i] = total_viagens
-            if meta > 0 and tpm_i > 0:
-                tmeta[i] = meta / tpm_i
+
+            # >>> NOVO: taxa por hora de relógio e tempo p/ meta (min)
+            if meta > 0 and total_ton > 0 and T_op_min > 0:
+                rate_elapsed_tph_i = total_ton / (T_op_min / 60.0)       # t/h (elapsed)
+                tmeta_min[i] = (meta / max(rate_elapsed_tph_i, EPS)) * 60.0
             elif meta <= 0:
-                tmeta[i] = 0.0
+                tmeta_min[i] = 0.0
             else:
-                tmeta[i] = np.nan
+                tmeta_min[i] = np.nan
 
         producao_res.append({
             "Frente": od_id,
@@ -270,17 +273,17 @@ def run_monte_carlo(
         })
         tempo_res.append({
             "Frente": od_id,
-            "Média_h": float(np.nanmean(tmeta) / 60.0),
-            "P5_h": float(np.nanpercentile(tmeta, 5) / 60.0),
-            "P50_h": float(np.nanpercentile(tmeta, 50) / 60.0),
-            "P95_h": float(np.nanpercentile(tmeta, 95) / 60.0),
+            "Média_h": float(np.nanmean(tmeta_min) / 60.0),
+            "P5_h": float(np.nanpercentile(tmeta_min, 5) / 60.0),
+            "P50_h": float(np.nanpercentile(tmeta_min, 50) / 60.0),
+            "P95_h": float(np.nanpercentile(tmeta_min, 95) / 60.0),
         })
 
         if return_samples:
             samples_ton_all.append(pd.DataFrame({"Frente": od_id, "ton": prod}))
             samples_frac_all.append(pd.DataFrame({"Frente": od_id, "frac_meta": frac}))
             samples_viag_all.append(pd.DataFrame({"Frente": od_id, "viagens": viag}))
-            samples_tempo_all.append(pd.DataFrame({"Frente": od_id, "tempo_min": tmeta}))
+            samples_tempo_all.append(pd.DataFrame({"Frente": od_id, "tempo_min": tmeta_min}))
 
     result = {
         "producao_df": pd.DataFrame(producao_res),

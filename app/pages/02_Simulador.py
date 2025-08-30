@@ -31,7 +31,7 @@ if str(root) not in sys.path:
 from core.io import load_from_data_dir
 from core.pipeline import run_greedy_sa_eval
 from core.sa import SAParams
-from core.mc import run_monte_carlo  # Monte Carlo corrigido
+from core.mc import run_monte_carlo  # MC corrigido (tempo em horas de relógio)
 
 # ---------------- dados ----------------
 @st.cache_data(show_spinner=True)
@@ -116,6 +116,15 @@ def get_sa_params_from_state() -> SAParams:
         random_state=int(p.get("random_state", 42)),
     )
 
+# ---------------- helper para escolher alocação ----------------
+def _pick_alloc(res) -> pd.DataFrame:
+    """Escolhe a melhor alocação disponível, sem usar 'or' em DataFrame."""
+    for key in ("sa_best_alloc", "alloc_greedy"):
+        df = res.get(key)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+    return pd.DataFrame(columns=["eqp_id", "od_id"])
+
 # ---------------- execução ----------------
 run_btn = st.button("Executar Simulação", type="primary")
 
@@ -176,8 +185,8 @@ if "last_result" in st.session_state:
 
     st.subheader("Sugestão de Alocação")
 
-    al = res.get("sa_best_alloc", res.get("alloc_greedy"))
-    if al is not None and not al.empty:
+    al = _pick_alloc(res)
+    if not al.empty:
         lista = al.groupby("od_id")["eqp_id"].apply(lambda s: ", ".join(sorted(map(str, s)))).reset_index()
         for _, row in lista.iterrows():
             st.write(f"**{row['od_id']}**: {row['eqp_id']}")
@@ -187,7 +196,7 @@ if "last_result" in st.session_state:
     # ===== Tabela por OD =====
     by_od_raw = res["sa_best_eval"]["by_od"].copy() if "sa_best_eval" in res else res["greedy_eval"]["by_od"].copy()
 
-    # renomeia para exibição
+    # renomeia para exibição (rate_elapsed_tph já está no evaluate corrigido; opcional exibir)
     by_od_show = by_od_raw.rename(columns={
         "od_id": "Frente (OD)",
         "ton_total": "Produção (t)",
@@ -198,6 +207,7 @@ if "last_result" in st.session_state:
         "excesso_t": "Excesso (t)",
         "tempo_para_meta_h": "Tempo p/ bater meta (h)",
         "viavel_no_turno": "Viável no turno?",
+        # "rate_elapsed_tph": "Taxa (t/h)",  # descomente se quiser mostrar
     })[
         ["Frente (OD)", "Produção (t)", "Viagens", "Caminhões",
          "Meta (t)", "Prioridade", "Excesso (t)", "Tempo p/ bater meta (h)",
@@ -236,97 +246,137 @@ if "last_result" in st.session_state:
     st.markdown("#### SA — Alocação por Frente")
     st.dataframe(styler, use_container_width=True)
 
+    # ===== Botão de download do CSV por caminhão (gerado no pipeline) =====
+    if res.get("eqp_csv_path"):
+        try:
+            with open(res["eqp_csv_path"], "rb") as fh:
+                st.download_button(
+                    "Baixar CSV por caminhão",
+                    data=fh.read(),
+                    file_name=Path(res["eqp_csv_path"]).name,
+                    mime="text/csv",
+                    type="secondary",
+                )
+        except Exception as e:
+            st.warning(f"Não foi possível anexar o CSV por caminhão: {e}")
+
     # ===== Monte Carlo (violino + resumos) =====
-    if al is not None and not al.empty and int(st.session_state.get("last_NMC", 0)) > 0:
+    if not al.empty and int(st.session_state.get("last_NMC", 0)) > 0:
         st.markdown("#### Monte Carlo — Distribuição das Simulações (Violino)")
         df_inputs_last = st.session_state.get("last_inputs")
         T_op_last = int(st.session_state.get("last_Top", 720))
         N_MC_last = int(st.session_state.get("last_NMC", 1000))
 
-        mc_full = run_monte_carlo(
-            aloc_df=al,
-            df_ciclo=df_ciclo,
-            df_inputs=df_inputs_last,
-            T_op_min=T_op_last,
-            N_MC=N_MC_last,
-            random_state=42,
-            return_samples=True,
-        )
+        # >>> Usa o alloc AVALIADO (com T_ef_min/cycle_min)
+        eval_pkg = res.get("sa_best_eval", res.get("greedy_eval"))
+        aloc_for_mc = eval_pkg["alloc"] if (eval_pkg and "alloc" in eval_pkg) else al
 
-        metric = st.radio(
-            "Métrica para o violino",
-            ["Fração da meta", "Produção (t)", "Nº de viagens", "Tempo p/ meta (min)"],
-            horizontal=True, index=0
-        )
+        try:
+            mc_full = run_monte_carlo(
+                aloc_df=aloc_for_mc,
+                df_ciclo=df_ciclo,
+                df_inputs=df_inputs_last,
+                T_op_min=T_op_last,
+                N_MC=N_MC_last,
+                random_state=42,
+                return_samples=True,
+            )
+        except Exception as e:
+            st.error(f"Falha ao rodar Monte Carlo: {e}")
+            mc_full = None
 
-        if metric == "Fração da meta":
-            samples, y_col, y_label = mc_full.get("samples_frac"), "frac_meta", "Fração da meta"
-        elif metric == "Produção (t)":
-            samples, y_col, y_label = mc_full.get("samples_ton"), "ton", "Produção (t)"
-        elif metric == "Nº de viagens":
-            samples, y_col, y_label = mc_full.get("samples_viagens"), "viagens", "Nº de viagens"
-        else:
-            samples, y_col, y_label = mc_full.get("samples_tempo"), "tempo_min", "Tempo para meta (min)"
+        if mc_full is not None:
+            metric = st.radio(
+                "Métrica para o violino",
+                ["Fração da meta", "Produção (t)", "Nº de viagens", "Tempo p/ meta (h)"],
+                horizontal=True, index=0
+            )
 
-        if samples is not None and not samples.empty:
-            try:
-                import plotly.graph_objects as go
-                samples = samples.copy()
-                samples["Frente"] = samples["Frente"].astype(str)
-                ord_ods = sorted(samples["Frente"].unique().tolist())
-                fig = go.Figure()
-                for od in ord_ods:
-                    y = samples.loc[samples["Frente"] == od, y_col]
-                    fig.add_trace(go.Violin(
-                        x=[od] * len(y), y=y, name=str(od),
-                        box_visible=True, meanline_visible=True, points=False
-                    ))
-                fig.update_layout(height=420, xaxis_title="Frente (OD)", yaxis_title=y_label)
-                st.plotly_chart(fig, use_container_width=True)
-            except ModuleNotFoundError:
-                import matplotlib.pyplot as plt
-                samples = samples.copy()
-                ord_ods = sorted(samples["Frente"].unique().tolist())
-                fig, ax = plt.subplots(figsize=(8, 4))
-                data_list = [samples.loc[samples["Frente"] == od, y_col].dropna().values for od in ord_ods]
-                ax.violinplot(data_list, showmeans=True, showmedians=True, showextrema=True)
-                ax.set_xticks(range(1, len(ord_ods) + 1))
-                ax.set_xticklabels(ord_ods, rotation=0)
-                ax.set_xlabel("Frente (OD)")
-                ax.set_ylabel(y_label)
-                st.pyplot(fig, use_container_width=True)
+            if metric == "Fração da meta":
+                samples, y_col, y_label = mc_full.get("samples_frac"), "frac_meta", "Fração da meta"
+            elif metric == "Produção (t)":
+                samples, y_col, y_label = mc_full.get("samples_ton"), "ton", "Produção (t)"
+            elif metric == "Nº de viagens":
+                samples, y_col, y_label = mc_full.get("samples_viagens"), "viagens", "Nº de viagens"
+            else:
+                # converte as amostras de minutos -> horas p/ coerência visual
+                samples = mc_full.get("samples_tempo")
+                if samples is not None and not samples.empty and "tempo_min" in samples.columns:
+                    samples = samples.copy()
+                    samples["tempo_h"] = samples["tempo_min"] / 60.0
+                    y_col, y_label = "tempo_h", "Tempo para meta (h)"
+                else:
+                    y_col, y_label = "tempo_min", "Tempo para meta (min)"
 
-        # Resumos em grid 2×2
-        st.markdown("#### Monte Carlo — Resumos")
-        colA1, colA2 = st.columns(2)
-        with colA1:
-            st.markdown("**Fração da meta (P5, P50, P95, média)**")
-            st.dataframe(mc_full["frac_df"], use_container_width=True, height=240)
-        with colA2:
-            st.markdown("**Produção (t) (P5, P50, P95, média)**")
-            st.dataframe(mc_full["producao_df"], use_container_width=True, height=240)
+            if samples is not None and not samples.empty:
+                try:
+                    import plotly.graph_objects as go
+                    samples = samples.copy()
+                    samples["Frente"] = samples["Frente"].astype(str)
+                    ord_ods = sorted(samples["Frente"].unique().tolist())
+                    fig = go.Figure()
+                    for od in ord_ods:
+                        y = samples.loc[samples["Frente"] == od, y_col]
+                        fig.add_trace(go.Violin(
+                            x=[od] * len(y), y=y, name=str(od),
+                            box_visible=True, meanline_visible=True, points=False
+                        ))
+                    fig.update_layout(height=420, xaxis_title="Frente (OD)", yaxis_title=y_label)
+                    st.plotly_chart(fig, use_container_width=True)
+                except ModuleNotFoundError:
+                    import matplotlib.pyplot as plt
+                    samples = samples.copy()
+                    ord_ods = sorted(samples["Frente"].unique().tolist())
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    data_list = [samples.loc[samples["Frente"] == od, y_col].dropna().values for od in ord_ods]
+                    ax.violinplot(data_list, showmeans=True, showmedians=True, showextrema=True)
+                    ax.set_xticks(range(1, len(ord_ods) + 1))
+                    ax.set_xticklabels(ord_ods, rotation=0)
+                    ax.set_xlabel("Frente (OD)")
+                    ax.set_ylabel(y_label)
+                    st.pyplot(fig, use_container_width=True)
 
-        colB1, colB2 = st.columns(2)
-        with colB1:
-            st.markdown("**Nº de viagens (P5, P50, P95, média)**")
-            st.dataframe(mc_full["viagens_df"], use_container_width=True, height=240)
-        with colB2:
-            st.markdown("**Tempo p/ meta (h) (P5, P50, P95, média)**")
-            st.dataframe(mc_full["tempo_df"], use_container_width=True, height=240)
+            # Resumos em grid 2×2
+            st.markdown("#### Monte Carlo — Resumos")
+            colA1, colA2 = st.columns(2)
+            with colA1:
+                st.markdown("**Fração da meta (P5, P50, P95, média)**")
+                st.dataframe(mc_full["frac_df"], use_container_width=True, height=240)
+            with colA2:
+                st.markdown("**Produção (t) (P5, P50, P95, média)**")
+                st.dataframe(mc_full["producao_df"], use_container_width=True, height=240)
+
+            colB1, colB2 = st.columns(2)
+            with colB1:
+                st.markdown("**Nº de viagens (P5, P50, P95, média)**")
+                st.dataframe(mc_full["viagens_df"], use_container_width=True, height=240)
+            with colB2:
+                st.markdown("**Tempo p/ meta (h) (P5, P50, P95, média)**")
+                st.dataframe(mc_full["tempo_df"], use_container_width=True, height=240)
 
     # ---------------- salvar CSVs ----------------
     out_dir = root / "data" / "outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if st.button("Aceitar alocação (salvar CSVs)"):
-        (res.get("sa_best_alloc", res.get("alloc_greedy")) or pd.DataFrame()).to_csv(
-            out_dir / f"alocacaoSA_{ts}.csv", index=False, encoding="utf-8-sig"
-        )
+        alloc_df = _pick_alloc(res)
+
+        # salva alocação
+        alloc_df.to_csv(out_dir / f"alocacaoSA_{ts}.csv", index=False, encoding="utf-8-sig")
+
+        # salva tabela por OD (a que você mostra formatada)
         export_by_od = by_od_show.copy()
         export_by_od.to_csv(out_dir / f"tabelaSA_por_OD_{ts}.csv", index=False, encoding="utf-8-sig")
-        lista = (res.get("sa_best_alloc", res.get("alloc_greedy")) or pd.DataFrame()).groupby("od_id")["eqp_id"] \
-            .apply(lambda s: ", ".join(sorted(map(str, s)))).reset_index()
-        if not lista.empty:
-            lista.columns = ["Frente (OD)", "Caminhões"]
-            lista.to_csv(out_dir / f"lista_caminhoes_por_frente_{ts}.csv", index=False, encoding="utf-8-sig")
+
+        # salva lista de caminhões por frente (só se houver linhas)
+        if not alloc_df.empty:
+            lista = (
+                alloc_df.groupby("od_id")["eqp_id"]
+                .apply(lambda s: ", ".join(sorted(map(str, s))))
+                .reset_index()
+            )
+            if not lista.empty:
+                lista.columns = ["Frente (OD)", "Caminhões"]
+                lista.to_csv(out_dir / f"lista_caminhoes_por_frente_{ts}.csv", index=False, encoding="utf-8-sig")
+
         st.success(f"Arquivos salvos em {out_dir}")

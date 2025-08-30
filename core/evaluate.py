@@ -12,10 +12,11 @@ Mudanças principais:
   * β=1.0  -> sem truncar (linear)
 - Penalidade de ociosidade por caminhão (μ = underutil_penalty), proporcional à fração ociosa.
 - Tabela por OD inclui:
-  * throughput_tph (t/h) efetivo (DF×UF via tempo efetivo)
-  * tempo_para_meta_h (horas necessárias p/ bater meta)
+  * throughput_tph (t/h) por truck-hour (usa ΣT_ef)
+  * rate_elapsed_tph (t/h) por hora de relógio (usa T_op)
+  * tempo_para_meta_h (horas corridas necessárias p/ bater a meta, via rate_elapsed_tph)
   * viagens_total (soma n_trips dos eqps)
-  * viavel_no_turno (bool)
+  * viavel_no_turno (bool comparando tempo_para_meta com T_op_min)
 """
 
 from __future__ import annotations
@@ -99,7 +100,7 @@ def _recompute_productivity(
             violations.append(f"Eqp '{eqp}' indisponível ou DF/UF inválidos.")
             continue
 
-        # FIX: fallback por modelo PRECISA da OD na chave
+        # Fallback por modelo considera a OD na chave
         c = cycle_eqp_od.get((eqp, od)) or cycle_model_od.get((eqp_to_model.get(eqp), od), None)
         if c is None or c <= 0:
             violations.append(f"Sem ciclo válido para eqp '{eqp}' em OD '{od}'.")
@@ -203,30 +204,27 @@ def evaluate_allocation(
     by_od["att_value"] = f
     by_od["excesso_t"] = np.maximum(by_od["ton_total"] - by_od["target_t"], 0.0)
 
-    # --- produtividade efetiva (realizada) e tempo para meta ---
-    # throughput_tph = ton_total / (T_ef_total_min/60)  -> t/h
+    # --- produtividade e tempo para meta (truck-hour x relógio) ---
+    # t/h por truck-hour (diagnóstico; usa ΣT_ef)
     by_od["throughput_tph"] = np.where(
         by_od["T_ef_total_min"] > 0,
         by_od["ton_total"] / (by_od["T_ef_total_min"] / 60.0),
         0.0
     )
-    # tempo necessário em horas para bater a meta ao ritmo realizado
-    by_od["tempo_para_meta_h"] = np.where(
-        (by_od["target_t"] > 0) & (by_od["throughput_tph"] > 0),
-        by_od["target_t"] / by_od["throughput_tph"],
-        np.nan
-    )
+    # concorrência efetiva média de caminhões no turno
+    k_eff = np.where(float(T_op_min) > 0, by_od["T_ef_total_min"] / float(T_op_min), 0.0)
+    # t/h por hora de relógio (usa T_op)
+    by_od["rate_elapsed_tph"] = by_od["throughput_tph"] * k_eff
+
+    # tempo necessário em horas corridas para bater a meta ao ritmo realizado
+    mask = (by_od["target_t"] > 0) & (by_od["rate_elapsed_tph"] > 0)
+    by_od["tempo_para_meta_h"] = np.where(mask, by_od["target_t"] / by_od["rate_elapsed_tph"], 0.0)
     by_od["tempo_para_meta_min"] = by_od["tempo_para_meta_h"] * 60.0
 
-    # viabilidade: só True se bateu meta E tempo necessário cabe no efetivo
-    tempo_min = by_od["tempo_para_meta_min"].fillna(np.inf)
-    Tef_min   = by_od["T_ef_total_min"].fillna(0.0)
-    by_od["viavel_no_turno"] = (
-        (by_od["ton_total"] >= by_od["target_t"]) &
-        (tempo_min <= Tef_min)
-    ).astype(bool)
+    # viabilidade no turno: comparar com T_op_min (horas de relógio)
+    by_od["viavel_no_turno"] = (by_od["tempo_para_meta_min"] <= float(T_op_min)).astype(bool)
 
-    # penalidade de ociosidade
+    # penalidade de ociosidade (por caminhão)
     alloc["used_min"] = alloc["n_trips"] * alloc["cycle_min"]
     by_k = alloc.groupby("eqp_id").agg(used_min=("used_min","sum"),
                                        T_eff=("T_ef_min","max")).reset_index()
@@ -244,7 +242,8 @@ def evaluate_allocation(
         "alloc": alloc.reset_index(drop=True),
         "by_od": by_od[[
             "od_id","ton_total","viagens_total","eqp_alocados","target_t","w_od",
-            "att_ratio","att_value","excesso_t","throughput_tph",
+            "att_ratio","att_value","excesso_t",
+            "throughput_tph","rate_elapsed_tph",
             "tempo_para_meta_h","tempo_para_meta_min","viavel_no_turno"
         ]],
         "objective": objective,
